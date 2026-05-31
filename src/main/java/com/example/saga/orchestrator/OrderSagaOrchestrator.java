@@ -1,16 +1,19 @@
 package com.example.saga.orchestrator;
 
 import com.example.saga.entity.Order;
+import com.example.saga.entity.EventStore;
 import com.example.saga.event.*;
 import com.example.saga.repository.OrderRepository;
 import com.example.saga.service.EventSourcingService;
 import com.example.saga.service.InventoryService;
 import com.example.saga.service.PaymentService;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.UUID;
+import java.util.List;
+import java.util.Optional;
 
 /**
  * OrderSagaOrchestrator is the core of the saga pattern.
@@ -31,6 +34,7 @@ public class OrderSagaOrchestrator {
     private final PaymentService paymentService;
     private final InventoryService inventoryService;
     private final EventSourcingService eventSourcingService;
+    private final ObjectMapper objectMapper;
 
     public Order startOrderSaga(OrderCreatedEvent event) {
         log.info("========== Starting Order Saga for Order ID: {} ==========", event.getOrderId());
@@ -79,8 +83,8 @@ public class OrderSagaOrchestrator {
             log.error("ERROR in Order Saga: {}", e.getMessage());
             log.info("========== Starting Compensation Transactions ==========");
 
-            // Compensation: Rollback all previous steps
-            compensateOrderSaga(order, event);
+            // Query the Event Store to find out what needs to be compensated
+            compensateOrderSaga(order.getId());
 
             order.setStatus(Order.OrderStatus.CANCELLED);
             orderRepository.save(order);
@@ -92,7 +96,8 @@ public class OrderSagaOrchestrator {
 
     private Order createOrder(OrderCreatedEvent event) {
         Order order = new Order();
-        order.setOrderId(String.valueOf(UUID.randomUUID()));
+        // Use the ID from the event to ensure the Event Store and Order table are linked correctly
+        order.setOrderId(String.valueOf(event.getOrderId()));
         order.setCustomerId(event.getCustomerId());
         order.setProductId(event.getProductId());
         order.setQuantity(event.getQuantity());
@@ -104,31 +109,59 @@ public class OrderSagaOrchestrator {
         return order;
     }
 
-    private void compensateOrderSaga(Order order, OrderCreatedEvent event) {
+    /**
+     * Uses Event Sourcing history to drive compensation logic.
+     * This ensures that even if the system crashed, we know exactly what was done.
+     */
+    private void compensateOrderSaga(Long orderId) {
         try {
-            // Compensation 1: Refund Payment
-            if (order.getStatus() == Order.OrderStatus.PAYMENT_COMPLETED ||
-                    order.getStatus() == Order.OrderStatus.INVENTORY_RESERVED) {
-                log.info("COMPENSATION 1: Refunding payment for order: {}", order.getId());
-                PaymentCompletedEvent paymentEvent = new PaymentCompletedEvent(
-                        order.getId(), event.getCustomerId(), "TXN-UNKNOWN"
-                );
-                paymentService.refundPayment(paymentEvent);
-                log.info("COMPENSATION 1: Payment refunded");
-            }
+            List<EventStore> history = eventSourcingService.getEventHistory(orderId);
+            log.info("Read {} events from history for compensation", history.size());
 
-            // Compensation 2: Release Inventory
-            if (order.getStatus() == Order.OrderStatus.INVENTORY_RESERVED) {
-                log.info("COMPENSATION 2: Releasing inventory for order: {}", order.getId());
-                InventoryReservationEvent inventoryEvent = new InventoryReservationEvent(
-                        order.getId(), event.getCustomerId(), event.getProductId(), event.getQuantity()
-                );
-                inventoryService.releaseInventory(inventoryEvent);
-                log.info("COMPENSATION 2: Inventory released");
-            }
+            // LIFO Compensation: Rollback steps in reverse order
+
+            // 1. Check for Inventory Reserved Event
+            findEvent(history, "INVENTORY_RESERVED", InventoryReservedEvent.class).ifPresent(inventoryEvent -> {
+                log.info("COMPENSATION: Releasing inventory for order: {}", orderId);
+                // We fetch the original request details from the ORDER_CREATED event
+                findEvent(history, "ORDER_CREATED", OrderCreatedEvent.class).ifPresent(createdEvent -> {
+                    InventoryReservationEvent releaseEvent = new InventoryReservationEvent(
+                            orderId, createdEvent.getCustomerId(), createdEvent.getProductId(), createdEvent.getQuantity()
+                    );
+                    inventoryService.releaseInventory(releaseEvent);
+                    log.info("COMPENSATION: Inventory released successfully");
+                });
+            });
+
+            // 2. Check for Payment Completed Event
+            findEvent(history, "PAYMENT_COMPLETED", PaymentCompletedEvent.class).ifPresent(paymentEvent -> {
+                log.info("COMPENSATION: Refunding payment for order: {} with TXN: {}", 
+                        orderId, paymentEvent.getTransactionId());
+                paymentService.refundPayment(paymentEvent);
+                log.info("COMPENSATION: Payment refunded successfully");
+            });
+
+            // Persist a compensation event for the audit trail
+            eventSourcingService.appendEvent(orderId, 
+                new CompensationEvent(orderId, null, "SAGA_ROLLBACK", "Failure during orchestration"), 
+                (long) history.size() + 1);
+
         } catch (Exception e) {
-            log.error("Error during compensation: {}", e.getMessage());
-            // In real scenarios, failed compensations should be logged and retried
+            log.error("CRITICAL: Error during compensation for Order {}: {}", orderId, e.getMessage());
         }
+    }
+
+    private <T> Optional<T> findEvent(List<EventStore> history, String type, Class<T> clazz) {
+        return history.stream()
+                .filter(e -> e.getEventType().equals(type))
+                .findFirst()
+                .map(e -> {
+                    try {
+                        return objectMapper.readValue(e.getEventData(), clazz);
+                    } catch (Exception ex) {
+                        log.error("Failed to deserialize event: {}", type);
+                        return null;
+                    }
+                });
     }
 }
